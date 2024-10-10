@@ -22,7 +22,7 @@ def build_dataset(is_train, args):
 
     root = os.path.join(args.data_path, 'train' if is_train else 'val')
     dataset = datasets.ImageFolder(root, transform=transform)
-
+    
     print(dataset)
 
     return dataset

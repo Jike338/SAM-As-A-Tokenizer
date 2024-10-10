@@ -20,7 +20,9 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+# import torchvision.datasets as datasets
+from object_folder import ImageFolder
+import object_transforms 
 
 import timm
 
@@ -99,7 +101,10 @@ def get_args_parser():
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
-                        help='url used to set up distributed training')
+                        help='url used to set up distributed training'),
+    parser.add_argument('--img_channels',   default=3, type=int),
+    parser.add_argument('--spalized_channels',   default=50, type=int),
+    parser.add_argument('--object_size_threshold',   default=50, type=int)
 
     return parser
 
@@ -121,11 +126,16 @@ def main(args):
 
     # simple augmentation
     transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+            object_transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  
+            object_transforms.RandomHorizontalFlip(),
+            object_transforms.ToTensor(),
+            object_transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            # objective tranform
+            object_transforms.Spalize(size=args.input_size, channels=args.img_channels, spalized_channels=args.spalized_channels, object_size_threshold=args.object_size_threshold)
+            ])
+            
+            
+    dataset_train = ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
     if True:  # args.distributed:

@@ -18,6 +18,63 @@ from timm.models.vision_transformer import PatchEmbed, Block
 
 from util.pos_embed import get_2d_sincos_pos_embed
 
+from timm.models.layers import to_2tuple
+
+from transformers import AutoModelForSemanticSegmentation, AutoImageProcessor
+
+from torchvision.transforms import Normalize
+
+
+class ObjectEmbed(nn.Module):
+    """ Image to Patch Embedding
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        
+    
+      
+    def forward(self, x):
+        B, C, H, W = x.shape
+        print(x.shape) 
+        x = self.model(x)
+        # upsample to the input size
+        x = x.logits
+        x = nn.functional.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+        return x
+
+# class ObjectEmbed(nn.Module):
+#     """ Image to Patch Embedding
+#     """
+#     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+#         super().__init__()
+#         img_size = to_2tuple(img_size)
+#         patch_size = to_2tuple(patch_size)
+#         num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+#         self.img_size = img_size
+#         self.patch_size = patch_size
+#         self.num_patches = num_patches
+#         checkpoint = "chendelong/DirectSAM-1800px-0424"
+#         self.image_processor = AutoImageProcessor.from_pretrained(checkpoint, reduce_labels=True)
+#         self.model = AutoModelForSemanticSegmentation.from_pretrained(checkpoint).to('cuda').eval()
+
+    
+      
+#     def forward(self, x):
+#         B, C, H, W = x.shape
+#         print(x.shape) 
+#         x = self.model(x)
+#         # upsample to the input size
+#         x = x.logits
+#         x = nn.functional.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+#         return x
+        
+        
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -213,7 +270,7 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
+    def forward(self, imgs, mask, mask_ratio=0.75):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         loss = self.forward_loss(imgs, pred, mask)
@@ -248,3 +305,13 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
 mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
+
+
+if __name__ == '__main__':
+    
+    # test object embedding
+    obj_embed = ObjectEmbed()
+    imgs = torch.randn(2, 3, 224, 224).to('cuda')
+    obj_feat = obj_embed(imgs)
+    print(obj_feat.shape)
+    
