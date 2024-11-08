@@ -128,7 +128,7 @@ def main(args):
     transform_train = transforms.Compose([
             object_transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  
             object_transforms.RandomHorizontalFlip(),
-            object_transforms.ToTensor(),
+            object_transforms.Object_ToTensor(),
             object_transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             # objective tranform
             object_transforms.Spalize(size=args.input_size, channels=args.img_channels, spalized_channels=args.spalized_channels, object_size_threshold=args.object_size_threshold)

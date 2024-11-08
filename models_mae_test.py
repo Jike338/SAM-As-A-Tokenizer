@@ -13,19 +13,15 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block, HybridEmbed
 
 from util.pos_embed import get_2d_sincos_pos_embed
 
 from timm.models.layers import to_2tuple
 
-from transformers import AutoModelForSemanticSegmentation, AutoImageProcessor
-
-from torchvision.transforms import Normalize
-
 from torchvision import models
-
 
 class InverseModifiedResNet34(nn.Module):
     def __init__(self, embed_dim, object_dim, output_channels=3, output_size=(224, 224)):
@@ -64,7 +60,7 @@ class InverseModifiedResNet34(nn.Module):
     def forward(self, x):
         B, O, _ = x.shape
         
-        # Inverse linear transformation: [B, O, embed_dim] -> [B, O, 512 * 49]
+        # Inverse linear transformation: [B, O, 768] -> [B, O, 512 * 49]
         x = self.inverse_linear(x)
         
         # Reshape to [B*O, 512, 7, 7] for deconvolution
@@ -77,7 +73,6 @@ class InverseModifiedResNet34(nn.Module):
         x = x.view(B, O, *x.shape[1:])
         
         return x
-
 
 
 class ModifiedResNet34(nn.Module):
@@ -116,13 +111,80 @@ class ModifiedResNet34(nn.Module):
         return x
 
 
+class BasicBlock(nn.Module):
+    expansion = 1
 
-class ObjectEmbed(nn.Module):
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, spalized_channels=49):
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class CustomResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=1000):
+        super(CustomResNet, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=7, stride=1, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.layer1 = self._make_layer(block, 32, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 64, num_blocks[1], stride=1)
+        self.layer3 = self._make_layer(block, 128, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 196, num_blocks[3], stride=2)
+        
+        self.linear = nn.Linear(784, 768)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))  # Initial conv layer
+        x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x) # (N, 128, 28, 28)
+        
+        # Flatten to [N, 128, 784]
+        x = x.flatten(2)
+        
+        # Apply linear transformation to get [N, 128, 768]
+        x = self.linear(x)
+        
+        return x
+
+
+class PatternEmbed(nn.Module):
+    """ Image to Patch Embedding
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, spalized_channels=50):
         super().__init__()
-        self.img_size = to_2tuple(img_size)
-        self.num_patches = spalized_channels
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        num_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
 
         # self.proj = CustomResNet(BasicBlock, [3, 4, 6, 3]) # Need a small mapping process to match the original ViT
         self.proj = ModifiedResNet34(embed_dim, spalized_channels)  # Need large additional Transformer layer to match the original ViT
@@ -134,29 +196,29 @@ class ObjectEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
 
         x = self.proj(x)
+    
+        self.num_patches = x.shape[1]
         
         return x
-
+    
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3,
-                 embed_dim=1024, spalized_channels=49, depth=24, num_heads=16,
+                 embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
         super().__init__()
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
-        self.patch_embed = ObjectEmbed(img_size, patch_size, in_chans, embed_dim, spalized_channels)
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
         print('num_patches:', num_patches)
-
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
         print('pos_embed:', self.pos_embed.shape)
-        
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
             for i in range(depth)])
@@ -176,9 +238,7 @@ class MaskedAutoencoderViT(nn.Module):
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        # self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
-        self.decoder_pred = InverseModifiedResNet34(decoder_embed_dim, spalized_channels, in_chans, (224, 224))
-        
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
         # --------------------------------------------------------------------------
 
         self.norm_pix_loss = norm_pix_loss
@@ -197,8 +257,8 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
-        # w = self.patch_embed.proj.weight.data
-        # torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        w = self.patch_embed.proj.weight.data
+        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
         torch.nn.init.normal_(self.cls_token, std=.02)
@@ -314,8 +374,6 @@ class MaskedAutoencoderViT(nn.Module):
 
         # predictor projection
         x = self.decoder_pred(x)
-        
-        print('decoder:', x.shape)
 
         # remove cls token
         x = x[:, 1:, :]
@@ -323,30 +381,24 @@ class MaskedAutoencoderViT(nn.Module):
         return x
 
     def forward_loss(self, imgs, pred, mask):
-            """
-            imgs: [N, L, 3, H, W]
-            pred: [N, L, 3, H, W]
-            mask: [N, L], 0 is keep, 1 is remove, 
-            """
-            N, L, C, H, W = imgs.shape
-            imgs = imgs.view(N, L, -1)
-            pred = pred.view(N, L, -1)
-            mask = mask.view(N, L)
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove, 
+        """
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5
 
-            if self.norm_pix_loss:
-                # Normalize imgs and pred
-                imgs_mean = imgs.mean(dim=-1, keepdim=True)
-                imgs_var = imgs.var(dim=-1, keepdim=True)
-                imgs = (imgs - imgs_mean) / (imgs_var + 1.e-6)**.5
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
 
-            loss = (imgs - pred).pow(2).mean(dim=-1)
-  
-            loss = (loss * mask).sum(dim=-1) / mask.sum(dim=-1)
-            loss = loss.mean()
-            return loss
-        
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        return loss
 
-    def forward(self, imgs, ori_imgs, spacial_mask, mask_ratio=0.5):
+    def forward(self, imgs, mask_ratio=0.75):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         loss = self.forward_loss(imgs, pred, mask)
@@ -356,7 +408,7 @@ class MaskedAutoencoderViT(nn.Module):
 def mae_vit_base_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
         patch_size=16, embed_dim=768, depth=12, num_heads=12,
-        decoder_embed_dim=512, spalized_channels=49, decoder_depth=8, decoder_num_heads=16,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -364,7 +416,7 @@ def mae_vit_base_patch16_dec512d8b(**kwargs):
 def mae_vit_large_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16,
-        decoder_embed_dim=512, spalized_channels=64, decoder_depth=8, decoder_num_heads=16,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -372,7 +424,7 @@ def mae_vit_large_patch16_dec512d8b(**kwargs):
 def mae_vit_huge_patch14_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
         patch_size=14, embed_dim=1280, depth=32, num_heads=16,
-        decoder_embed_dim=512, spalized_channels=196, decoder_depth=8, decoder_num_heads=16,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -383,14 +435,34 @@ mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 b
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
 
 
+# test main code
 if __name__ == '__main__':
+    # check cuda availability
+    print(torch.cuda.is_available())
+    imgs = torch.randn(1, 50, 3, 224, 224)
+    # test PatternEmbed
+    patternembed = PatternEmbed()
+    print(patternembed.img_size, patternembed.patch_size, patternembed.num_patches)
+    x = patternembed(imgs)
+    print(x.shape)
+    print(patternembed.num_patches)
     
-    # test Model 
-    model = mae_vit_large_patch16()
-    imgs = torch.randn(1, 64, 3, 224, 224)
-    mask = torch.randint(0, 256, (1, 1, 224, 224), dtype=torch.uint8)
-    ori_imgs = torch.randn(1, 3, 224, 224)
-    loss, pred, mask = model(imgs, ori_imgs, mask)
-    print(loss, pred.shape, mask.shape)
+    decoder = InverseModifiedResNet34(768, 50)
     
+    x = decoder(x)
+    print(x.shape)
+    
+    # test model
+    model = mae_vit_base_patch16()
+    
+    # net = CustomResNet(BasicBlock, [3, 4, 6, 3])
+    # x = net(imgs)
+    # print(x.shape)
+    
+    # test hybridembed
+    # hybridembed = HybridEmbed(net)
+    # print(hybridembed.img_size, hybridembed.patch_size, hybridembed.num_patches)
+    # x = hybridembed(imgs)
+    # print(x.shape)
+    # print(hybridembed.num_patches)
     

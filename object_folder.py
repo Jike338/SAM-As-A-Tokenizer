@@ -243,13 +243,19 @@ class DatasetFolder(VisionDataset):
         """
         path, target = self.samples[index]
         sample = self.loader(path)
-        mask = self.loader(path.replace("train", "mask"))
+        if "/train/" in path:
+            mask = self.loader(path.replace("/train/", "/mask/").replace("JPEG", "png"))
+        elif "/val/" in path:
+            mask = self.loader(path.replace("/val/", "/mask/").replace("JPEG", "png"))
+        else:
+            raise ValueError("Unknown dataset split")
+          
         if self.transform is not None:
-            sample = self.transform(sample, mask)
+            sample, ori_img, mask = self.transform([sample, mask])
         if self.target_transform is not None:
             target = self.target_transform(target)
 
-        return sample, target, mask
+        return sample, ori_img, mask, target
 
     def __len__(self) -> int:
         return len(self.samples)
